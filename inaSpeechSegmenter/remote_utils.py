@@ -1,3 +1,10 @@
+"""
+Model Retrieval Module for inaSpeechSegmenter:
+Defines remote URLs for pre-trained model files and provides the get_remote function to retrieve them.
+get_remote first checks if the model is available locally (e.g., in a Docker container at /root/.keras/inaSpeechSegmenter/)
+and, if not, downloads it using Keras's get_file utility to the local cache (~/.keras/inaSpeechSegmenter/).
+"""
+
 import os
 from keras.utils import get_file
 
@@ -16,6 +23,11 @@ dmodels = {
 
 
 def get_remote(model_fname):
+    """
+    Retrieves the specified model file for inaSpeechSegmenter.
+    It first checks for a locally cached version (useful in Docker environments) at /root/.keras/inaSpeechSegmenter/.
+    If not found, it downloads the model using Keras's get_file utility from the appropriate remote URL as defined in dmodels.
+    """
     # if in a docker image, try to get the file in /root/.keras
     rootpath = '/root/.keras/inaSpeechSegmenter/' + model_fname
     if os.access(rootpath, os.R_OK):
