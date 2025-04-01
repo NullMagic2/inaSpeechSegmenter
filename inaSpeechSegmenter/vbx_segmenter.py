@@ -11,7 +11,6 @@ and gender-based audio analysis.
 
 import os
 from abc import ABC, abstractmethod
-import platform  # Import platform module
 import numpy as np
 import onnxruntime as ort
 import logging
@@ -20,14 +19,15 @@ import logging
 import keras
 from pyannote.core import Segment, Annotation, Timeline
 
-#utils import get_remote
+# from .resnet import ResNet101
+from .features_vbx import povey_window, mel_fbank_mx, add_dither, fbank_htk, cmvn_floating_kaldi
+from .segmenter import Segmenter
+from .io import media2sig16kmono
+from .remote_utils import get_remote
 
-# Setup logger if not already done
+#torch.backends.cudnn.enabled = True
 logger = logging.getLogger(__name__)
-# Ensure basic config in case it wasn't set globally
-if not logger.hasHandlers():
-    logging.basicConfig(level=logging.INFO)
-
+logging.basicConfig(level=logging.INFO)
 
 STEP = 24
 WINLEN = 144
@@ -44,18 +44,19 @@ def is_mid_speech(start, stop, a_vad):
     speech segment in the VAD annotation (a_vad). It returns True if the midpoint is inside at least one speech segment,
     indicating that the segment likely contains speech.
 
-    Note: The previous implementation iterated through all VAD segments for each x-vector. This version has been rewritten for
-    clarity and returns True as soon as a mid-speech match is found.
+    Note: The current implementation iterates through all VAD segments for each x-vector. An optimization is recommended 
+    for processing large numbers of x-vectors.
     """
     midpoint = (start + stop) / 2
 
-    # Check each VAD segment to see if it contains the midpoint.
+    # Check if the midpoint falls within any speech segment.
     for seg, _, _ in a_vad.itertracks(yield_label=True):
         if (seg.start < midpoint) and (midpoint < seg.end):
             return True
 
     return False
-    
+
+
 def add_needed_vectors(xvectors, t_mid):
     """
     Ensure that at least 50% of the predictions have midpoints within speech segments.
@@ -78,26 +79,21 @@ def add_needed_vectors(xvectors, t_mid):
 
 def get_femininity_score(g_preds):
     """
-    Computes a weighted voice femininity score using gender prediction probabilities.
+    Computes the voice femininity score from gender prediction segments.
 
-    Instead of a binary decision for each segment, this function calculates the overall femininity score 
-    as the weighted average of the female probabilities, with weights based on the segment durations.
-    
-    Parameters:
-        g_preds (list): List of tuples (start, stop, p) where p is the predicted probability of being female.
-    
+    This function creates an annotation from gender predictions, where each prediction is a tuple
+    (start, stop, p) and p (a probability) is interpreted as female if p >= 0.5. It then computes the
+    femininity score as the ratio of the number of segments labeled as female to the total number of segments.
+
     Returns:
-        float: The weighted femininity score, between 0 and 1.
+        float: The femininity score, representing the proportion of segments identified as female.
     """
-    total_duration = 0.0
-    female_weight = 0.0
-    
+    a_temp = Annotation()
     for start, stop, p in g_preds:
-        duration = stop - start
-        total_duration += duration
-        female_weight += duration * p
-        
-    return female_weight / total_duration if total_duration > 0 else 0.0
+        a_temp[Segment(start, stop), '_'] = (p >= 0.5)
+
+    # Return binary score and number of retained predictions
+    return len(a_temp.label_timeline(True)) / len(a_temp)
 
 
 def get_annot_VAD(vad_tuples):
@@ -382,191 +378,34 @@ class OnnxBackendExtractor(VBxExtractor):
     """
     An x-vector extractor implementation that uses an ONNX model for inference.
 
-    This class loads the pre-trained x-vector extraction model from an ONNX file
-    ("final.onnx") using the ONNX Runtime. It dynamically selects the best
-    available execution provider based on the operating system and hardware:
-    - Windows: Prefers DirectML (DmlExecutionProvider), then CUDA, then CPU.
-    - Linux:   Prefers ROCm (ROCMExecutionProvider), then CUDA, then CPU.
-    - Other:   Prefers CPU or other available providers like CoreML if relevant.
-
-    Requires appropriate onnxruntime package:
-    - onnxruntime-directml for DirectML support on Windows.
-    - onnxruntime-gpu for CUDA (Win/Linux) and ROCm (Linux) support.
-    - onnxruntime (base package) provides CPU support.
+    This class loads the pre-trained x-vector extraction model from an ONNX file ("final.onnx") using the ONNX Runtime.
+    It sets up the inference session with a preference for CUDA if available (falling back to CPU otherwise). The input and output 
+    tensor names are retrieved from the model, and the get_embedding method runs the model on a given segment of features to produce 
+    an x-vector embedding.
     """
     def __init__(self):
-        """
-        Initializes the extractor by loading the ONNX model and setting up the
-        inference session with the best available execution provider.
-        """
-        # Define constants needed if __call__ is implemented here
-        # self.STEP = 24
-        # self.WINLEN = 144
-
-        model_path = get_remote("final.onnx") # Assumes final.onnx exists or get_remote works
+        model_path = get_remote("final.onnx")
         so = ort.SessionOptions()
-        so.log_severity_level = 3 # Reduce ONNX logging verbosity
-
-        # Determine available providers in the installed ONNX Runtime
-        available_providers = ort.get_available_providers()
-        logger.info(f"Available ONNX Runtime Execution Providers: {available_providers}")
-
-        # Define preferred provider order based on OS
-        preferred_providers = []
-        system = platform.system()
-
-        if system == "Windows":
-            # Order: DirectML -> CUDA -> CPU
-            preferred_providers.append('DmlExecutionProvider')
-            preferred_providers.append('CUDAExecutionProvider')
-            preferred_providers.append('CPUExecutionProvider')
-        elif system == "Linux":
-            # Order: ROCm -> CUDA -> CPU
-            preferred_providers.append('ROCMExecutionProvider')
-            preferred_providers.append('CUDAExecutionProvider')
-            preferred_providers.append('CPUExecutionProvider')
-        else: # macOS or other OS
-            # Add other providers if relevant, e.g., CoreML for macOS
-            # Example: Check and add CoreML if available
-            if 'CoreMLExecutionProvider' in available_providers:
-                preferred_providers.append('CoreMLExecutionProvider')
-            preferred_providers.append('CPUExecutionProvider')
-
-        # Filter the preferred list to only include available providers
-        valid_providers = [p for p in preferred_providers if p in available_providers]
-
-        # Ensure CPU is always an option if everything else fails
-        if not valid_providers:
-             logger.warning("No preferred providers were available. Defaulting to CPU.")
-             if 'CPUExecutionProvider' in available_providers:
-                 valid_providers = ['CPUExecutionProvider']
-             else:
-                 # This is highly unlikely unless ORT installation is broken
-                 raise RuntimeError("CPUExecutionProvider is not available in ONNX Runtime!")
-        elif 'CPUExecutionProvider' not in valid_providers:
-             # Append CPU if it wasn't already added (e.g., if only GPU providers were preferred but unavailable)
-             if 'CPUExecutionProvider' in available_providers:
-                  valid_providers.append('CPUExecutionProvider')
-
-
-        logger.info(f"Attempting to load ONNX model with providers: {valid_providers}")
-
+        so.log_severity_level = 3
         try:
-            # Load the model with the prioritized list of available providers
-            model = ort.InferenceSession(model_path, so, providers=valid_providers)
-            # Log the provider actually being used
-            actual_provider = model.get_providers()
-            logger.info(f"ONNX Runtime using provider(s): {actual_provider}")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize ONNX InferenceSession with providers {valid_providers}: {e}")
-            logger.warning("Falling back to CPUExecutionProvider only.")
-            try:
-                 # Fallback explicitly to CPU if the preferred list failed
-                 if 'CPUExecutionProvider' not in available_providers:
-                      raise RuntimeError("CPUExecutionProvider not available even for fallback!")
-                 model = ort.InferenceSession(model_path, so, providers=['CPUExecutionProvider'])
-                 logger.info("ONNX Runtime using provider(s): ['CPUExecutionProvider']")
-            except Exception as fallback_e:
-                 logger.error(f"Failed to initialize ONNX InferenceSession even with CPU! Error: {fallback_e}")
-                 raise fallback_e # Re-raise the exception if CPU also fails
-
-        # Store model and input/output names
+            model = ort.InferenceSession(model_path, so, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        except:
+            model = ort.InferenceSession(model_path, so, providers=['CPUExecutionProvider'])
         self.input_name = model.get_inputs()[0].name
         self.label_name = model.get_outputs()[0].name
         self.model = model
 
     def get_embedding(self, fea):
         """
-        Compute an x-vector embedding for a given segment of features using the
-        loaded ONNX model.
+        Compute an x-vector embedding for a given segment of features.
 
         Parameters:
-            fea (numpy.ndarray): A 2D array of features for a segment (expected shape e.g., [WINLEN, FEAT_DIM]).
+            fea (numpy.ndarray): A 2D array of features for a segment.
 
         Returns:
-            numpy.ndarray: The computed x-vector embedding (1D array).
+            numpy.ndarray: The x-vector embedding obtained by running inference on the input features.
         """
-        # Ensure input is float32, transpose to [FEAT_DIM, WINLEN], and add batch dimension [1, FEAT_DIM, WINLEN]
-        # Adjust transpose if model expects [batch, time, features] instead of [batch, features, time]
-        input_data = fea.astype(np.float32).transpose()[np.newaxis, :, :]
-        # Alternatively, if model expects [batch, time, features]:
-        # input_data = fea.astype(np.float32)[np.newaxis, :, :]
-
-        # Run inference
-        result = self.model.run(
+        return self.model.run(
             [self.label_name],
-            {self.input_name: input_data}
-        )
-        # Squeeze the batch dimension from the output -> [embed_dim]
-        return result[0].squeeze()
-
-    # You still need the __call__ method here to make the class fully functional
-    # It should contain the logic to loop through the features `fea`,
-    # extract segments, call `self.get_embedding` on each, and format the output list.
-    def __call__(self, basename, fea, duration):
-        """
-        Extract x-vector embeddings from the full input feature matrix by segmenting it.
-
-        Parameters:
-            basename (str): A base name used for generating unique keys for each segment.
-            fea (numpy.ndarray): The input feature matrix (e.g., [num_frames, FEAT_DIM]).
-            duration (float): The total duration of the audio signal in seconds.
-
-        Returns:
-            list: A list of tuples, each containing:
-                - a unique key (str) for the segment,
-                - a tuple (seg_start_sec, seg_end_sec),
-                - the x-vector embedding (numpy.ndarray), scaled by 10.
-        """
-        # Define constants locally or access them via self if defined in __init__
-        STEP = 24
-        WINLEN = 144
-        # FEAT_DIM = 64 # Not needed directly here, inferred from fea.shape
-
-        xvectors = []
-        start_frame = 0
-        num_frames = fea.shape[0]
-        frames_per_sec = 100.0 # Assuming 10ms frame shift for timestamp calculation
-
-        # Loop through overlapping windows
-        for start_frame in range(0, num_frames - WINLEN + 1, STEP):
-            end_frame = start_frame + WINLEN
-            data = fea[start_frame:end_frame, :] # Get segment [WINLEN, FEAT_DIM]
-
-            try:
-                xvector = self.get_embedding(data)
-                key = f'{basename}_{start_frame:08d}-{end_frame:08d}'
-
-                # Check for NaNs before proceeding
-                if np.isnan(xvector).any():
-                    logger.warning(f'NaN found in xvector, not processing segment: {key}')
-                else:
-                    seg_start_sec = round(start_frame / frames_per_sec, 3)
-                    seg_end_sec = round(end_frame / frames_per_sec, 3)
-                    # Append tuple: (key, (start_sec, end_sec), embedding * 10)
-                    xvectors.append((key, (seg_start_sec, seg_end_sec), xvector * 10))
-            except Exception as e:
-                 logger.error(f"Error processing segment {start_frame}-{end_frame}: {e}")
-
-
-        # Handle the last partial segment if it's long enough
-        last_segment_start = start_frame + STEP # start_frame holds the beginning of the last full segment processed
-        if num_frames - last_segment_start >= 10: # Minimum length check
-            data = fea[last_segment_start:num_frames, :]
-            try:
-                xvector = self.get_embedding(data) # Model should handle variable length input if designed for it, otherwise needs padding
-                key = f'{basename}_{last_segment_start:08d}-{num_frames:08d}'
-
-                if np.isnan(xvector).any():
-                    logger.warning(f'NaN found in last xvector, not processing segment: {key}')
-                else:
-                    seg_start_sec = round(last_segment_start / frames_per_sec, 3)
-                    # Use the full duration for the end time of the last segment
-                    seg_end_sec = round(duration, 3)
-                    xvectors.append((key, (seg_start_sec, seg_end_sec), xvector * 10))
-            except Exception as e:
-                 logger.error(f"Error processing last segment {last_segment_start}-{num_frames}: {e}")
-
-
-        return xvectors
+            {self.input_name: fea.astype(np.float32).transpose()[np.newaxis, :, :]}
+        )[0].squeeze()
