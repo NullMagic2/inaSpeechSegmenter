@@ -1,3 +1,14 @@
+"""
+This module implements a comprehensive voice femininity scoring system that integrates several key components:
+- VBx Feature Extraction: Computes x-vector embeddings from audio signals using a selected backend (currently ONNX).
+- Voice Activity Detection (VAD): Uses inaSpeechSegmenter's segmentation to detect speech regions.
+- Gender Detection: Applies a pre-trained gender detection model to estimate a voice femininity score.
+
+Additionally, the module includes utility functions to process VAD annotations, manage x-vector retention, and compute 
+features from audio signals (e.g., mel spectrograms and VBx features). It is designed for applications in speaker verification 
+and gender-based audio analysis.
+"""
+
 import os
 from abc import ABC, abstractmethod
 import numpy as np
@@ -27,11 +38,15 @@ SR = 16000
 
 def is_mid_speech(start, stop, a_vad):
     """
-    Compute midpoint of segment and return True if it's a speech detected segment (from Voice activity detection)
+    Determines if the midpoint of a segment falls within a speech region detected by VAD.
+
+    This function calculates the midpoint of the segment (average of start and stop) and checks if it lies within any
+    speech segment in the VAD annotation (a_vad). It returns True if the midpoint is inside at least one speech segment,
+    indicating that the segment likely contains speech.
+
+    Note: The current implementation iterates through all VAD segments for each x-vector. An optimization is recommended 
+    for processing large numbers of x-vectors.
     """
-    ## TODO : major refactor : here every X-vector requires to process all VAD
-    # IDEA : create an array corresponding to the number of xvector, set all to false
-    # iter on segments and for each segment set to true the corresponding xvector indices (much faster)
     m = (start + stop) / 2
     is_speech = [True if seg.start < m < seg.end else False for seg, _, _ in a_vad.itertracks(yield_label=True)]
     return np.any(is_speech)
@@ -39,7 +54,12 @@ def is_mid_speech(start, stop, a_vad):
 
 def add_needed_vectors(xvectors, t_mid):
     """
-    Keep at least 50% preds whose midpoint is in speech segment
+    Ensure that at least 50% of the predictions have midpoints within speech segments.
+
+    This function checks if the current number of x-vectors (xvectors) is less than 50% of the total candidates
+    (represented by t_mid). If so, it sorts the candidates in descending order by a certain criterion (first column in t_mid),
+    and appends additional x-vectors from t_mid to reach the minimum required number. This helps maintain a sufficient number
+    of predictions that are likely to be in speech segments.
     """
     min_pred = round(0.5 * len(t_mid))
     if len(xvectors) < min_pred:
@@ -53,6 +73,16 @@ def add_needed_vectors(xvectors, t_mid):
 
 
 def get_femininity_score(g_preds):
+    """
+    Computes the voice femininity score from gender prediction segments.
+
+    This function creates an annotation from gender predictions, where each prediction is a tuple
+    (start, stop, p) and p (a probability) is interpreted as female if p >= 0.5. It then computes the
+    femininity score as the ratio of the number of segments labeled as female to the total number of segments.
+
+    Returns:
+        float: The femininity score, representing the proportion of segments identified as female.
+    """
     a_temp = Annotation()
     for start, stop, p in g_preds:
         a_temp[Segment(start, stop), '_'] = (p >= 0.5)
@@ -62,6 +92,15 @@ def get_femininity_score(g_preds):
 
 
 def get_annot_VAD(vad_tuples):
+    """
+    Create a VAD annotation from a list of VAD tuples.
+
+    This function takes a list of tuples (label, start, end) and constructs an Annotation object,
+    including only those segments labeled as "speech". Each speech segment is added as a Segment with the label "speech".
+    
+    Returns:
+        Annotation: An annotation containing only the speech segments.
+    """
     annot_vad = Annotation()
     for lab, start, end in vad_tuples:
         if lab == "speech":
@@ -70,6 +109,30 @@ def get_annot_VAD(vad_tuples):
 
 
 def get_features(signal, LC=150, RC=149):
+
+    """
+    Extracts VBx features from an audio signal for speaker diarization and related tasks.
+
+    This function was entirely compiled the VBx script 'predict.py', available at:
+    ttps://github.com/BUTSpeechFIT/VBx/blob/master/VBx/predict.py 
+    
+    It computes a feature representation of the input signal by performing the following steps:
+      - Applies a Povey window to frame the signal.
+      - Constructs a Mel filterbank matrix with specified parameters (e.g., FEAT_DIM, LOFREQ, HIFREQ).
+      - Adds dithering to the signal for numerical stability.
+      - Applies symmetric padding to the signal.
+      - Computes the power spectrum using a triangular filterbank (HTK-compatible) via fbank_htk.
+      - Normalizes the features using a floating window CMVN (Cepstral Mean and Variance Normalization).
+
+    Parameters:
+        signal (numpy.ndarray): The input audio signal.
+        LC (int): Left context for CMVN (default 150).
+        RC (int): Right context for CMVN (default 149).
+
+    Returns:
+        numpy.ndarray: A 2D array of normalized features suitable for use in the VBx x-vector extraction pipeline.
+    """
+    
     """
     This code function is entirely copied from the VBx script 'predict.py'
     https://github.com/BUTSpeechFIT/VBx/blob/master/VBx/predict.py
@@ -91,17 +154,40 @@ def get_features(signal, LC=150, RC=149):
 
 class VoiceFemininityScoring:
     """
-    Perform VBx features extraction and give a voice femininity score.
+    A class to compute a voice femininity score using a combination of VBx x-vector extraction, 
+    voice activity detection, and gender detection.
+    
+    (For more information about the backend, see : https://github.com/BUTSpeechFIT/VBx)
+    
+    The process involves:
+      - Extracting x-vector embeddings from audio using a VBx extractor (currently supporting the ONNX backend).
+      - Applying voice activity detection (VAD) to identify speech regions via inaSpeechSegmenter.
+      - Using a pre-trained gender detection MLP model (with criteria "bgc" or "vfp") to predict gender probabilities
+        for the speech segments.
+    
+    The computed femininity score reflects the proportion of speech segments that are predicted to be female, and
+    can be used in applications like speaker diarization and gender-based audio analysis.
+    
+    The __init__ method loads the required models and sets parameters (such as VAD thresholds) based on the chosen 
+    gender detection criteria and backend.
     """
 
     def __init__(self, gd_model_criteria="bgc", backend='onnx'):
         """
-        Load VBx model weights according to the chosen backend
-        (See : https://github.com/BUTSpeechFIT/VBx)
-        Load Voice activity detection from inaSpeechSegmenter and finally
-        load Gender detection model to estimate voice femininity.
-        """
+        Load VBx model weights according to the chosen backend and initialize the voice activity detection and 
+        gender detection models.
 
+        Parameters:
+            gd_model_criteria (str): Criterion for selecting the gender detection model.
+                                     Options are "bgc" (default) and "vfp".
+            backend (str): Backend for the VBx x-vector extractor. Currently, only 'onnx' is supported.
+        
+        The method:
+            - Instantiates the VBx x-vector extractor (using the ONNX backend).
+            - Loads the gender detection model based on the specified criterion, setting an appropriate VAD threshold.
+            - Initializes the voice activity detection (VAD) model from inaSpeechSegmenter.
+        """
+        
         # VBx Extractor
         assert backend in ['onnx'], "Backend should be 'onnx' (or 'pytorch' if uncommented)."
         if backend == "onnx":
@@ -146,13 +232,21 @@ class VoiceFemininityScoring:
 
     def __call__(self, fpath, tmpdir=None):
         """
-        Return Voice Femininity Score of a given file with values before last sigmoid activation :
-                * convert file to wav 16k mono with ffmpeg
-                * operate Mel bands extraction
-                * operate voice activity detection using ISS VAD ('smn')
-                * get VBx features
-                * apply gender detection model and compute femininity score
-                * return score, duration of detected speech and number of retained x-vectors
+        Processes an audio file to compute its voice femininity score.
+    
+        The function performs the following steps:
+          - Converts the input media file (fpath) to a 16kHz mono WAV signal using ffmpeg.
+          - Extracts Mel band features from the signal.
+          - Applies voice activity detection (VAD) via inaSpeechSegmenter to obtain speech segments.
+          - Computes VBx x-vector embeddings from the extracted features.
+          - Refines the x-vectors using the VAD results.
+          - Uses a pre-trained gender detection model (MLP) to predict gender probabilities for each x-vector.
+          - Computes a femininity score based on the proportion of speech segments predicted as female.
+          
+        Returns:
+            score (float or None): The voice femininity score (before final sigmoid activation), or None if no speech is detected.
+            speech_duration (float): Total duration (in seconds) of detected speech segments.
+            nb_vectors (int): The number of x-vectors retained after VAD-based filtering.
         """
         basename, ext = os.path.splitext(os.path.basename(fpath))[0], os.path.splitext(os.path.basename(fpath))[1]
 
@@ -167,21 +261,20 @@ class VoiceFemininityScoring:
 
         if speech_duration:
 
-            # Processing features (mel bands extraction)
+            # Extract Mel band features from the signal.
             features = get_features(signal)
 
-            # Get xvector embeddings
-            # TODO : xvectors should be computed AFTER VAD!!
-            # This is the most costly part of the code
-            # The vbx extractor code should not need basename nor duration
-            # it currently returns (key, (seg_start, seg_end), xvector
-            # it can be splitted into 3 methods :
-            # M1 : return list of (seg_start, seg_end) based on len(features)
-            # M2 : compute xvectors based on features and list of (seg_start, seg_end)
-            # M3 : between M1 & M2 : discard elements based on VAD before computing x-vectors
+            # Compute x-vector embeddings using the VBx extractor.
+            # NOTE: This is the most computationally expensive step and ideally should be performed
+            # after applying VAD to avoid processing non-speech segments.
+            # Currently, the VBx extractor returns tuples in the form (key, (seg_start, seg_end), xvector).
+            # In the future, this process can be modularized into:
+            #   M1: Identifying (seg_start, seg_end) segments from the feature length.
+            #   M2: Computing x-vectors from features given the identified segments.
+            #   M3: Applying VAD filtering between M1 and M2 to discard non-speech segments.
             x_vectors = self.xvector_model(basename, features, duration)
 
-            # VAD application (before gender detection)
+            # Apply VAD filtering to refine x-vector selection before gender detection.
             x_vectors = self.apply_vad(x_vectors, annot_vad)
 
             # Applying gender detection (pretrained Multi layer perceptron)
@@ -190,7 +283,7 @@ class VoiceFemininityScoring:
             if len(gender_pred) > 1:
                 gender_pred = np.squeeze(gender_pred)
 
-            # Link segment start/stop from x-vectors extraction to gender predictions
+            # Link segment start/stop from x-vectors extraction to gender predictions.
             gender_pred = np.asarray(
                 [(segtup[0], segtup[1], pred) for (_, segtup, _), pred in zip(x_vectors, gender_pred)])
 
@@ -204,7 +297,23 @@ class VoiceFemininityScoring:
 
 class VBxExtractor(ABC):
     """
-    VBxExtractor is an abstract class performing xvector extraction.
+    VBxExtractor is an abstract base class for extracting x-vector embeddings from audio features.
+
+    This class defines a common interface for x-vector extraction across different backends.
+    Subclasses must implement the __init__ method to initialize the model and the get_embedding method 
+    to compute an embedding for a given segment of features.
+
+    The __call__ method divides the input feature matrix (fea) into overlapping segments of fixed length (WINLEN),
+    computes an x-vector for each segment, and collects these into a list of tuples in the form:
+        (unique_key, (seg_start, seg_end), xvector)
+
+    Each key is generated using the basename and the segment boundaries, and the x-vector is scaled by 10
+    for output standardization (to achieve a standard deviation of 1). 
+
+    Note: The segmentation logic currently implemented in __call__ could be refactored into three distinct steps:
+        M1: Identify segment boundaries (start, end) based on the feature length.
+        M2: Compute x-vectors from the features using these boundaries.
+        M3: Optionally filter segments based on voice activity detection (VAD) before computing x-vectors.
     """
     @abstractmethod
     def __init__(self):
@@ -215,6 +324,20 @@ class VBxExtractor(ABC):
         pass
 
     def __call__(self, basename, fea, duration):
+        """
+        Extract x-vector embeddings from the input feature matrix.
+
+        Parameters:
+            basename (str): A base name used for generating unique keys for each segment.
+            fea (numpy.ndarray): The input feature matrix.
+            duration (float): The total duration of the audio signal, used to determine the last segment's boundaries.
+
+        Returns:
+            list: A list of tuples, each containing:
+                - a unique key (str) for the segment,
+                - a tuple (seg_start, seg_end) representing the segment's start and end times (in seconds),
+                - the x-vector embedding (numpy.ndarray) for that segment, scaled by 10.
+        """
         # SHOULD BE FACTORIZED and use feats, with list (start, end)
         # number of lines could be divided by 2
         xvectors = []
@@ -247,6 +370,14 @@ class VBxExtractor(ABC):
 
 
 class OnnxBackendExtractor(VBxExtractor):
+    """
+    An x-vector extractor implementation that uses an ONNX model for inference.
+
+    This class loads the pre-trained x-vector extraction model from an ONNX file ("final.onnx") using the ONNX Runtime.
+    It sets up the inference session with a preference for CUDA if available (falling back to CPU otherwise). The input and output 
+    tensor names are retrieved from the model, and the get_embedding method runs the model on a given segment of features to produce 
+    an x-vector embedding.
+    """
     def __init__(self):
         model_path = get_remote("final.onnx")
         so = ort.SessionOptions()
@@ -260,29 +391,16 @@ class OnnxBackendExtractor(VBxExtractor):
         self.model = model
 
     def get_embedding(self, fea):
+        """
+        Compute an x-vector embedding for a given segment of features.
+
+        Parameters:
+            fea (numpy.ndarray): A 2D array of features for a segment.
+
+        Returns:
+            numpy.ndarray: The x-vector embedding obtained by running inference on the input features.
+        """
         return self.model.run(
             [self.label_name],
             {self.input_name: fea.astype(np.float32).transpose()[np.newaxis, :, :]}
         )[0].squeeze()
-
-# # Backend implementation with torch
-# # See VBx project : https://github.com/BUTSpeechFIT/VBx/blob/master/VBx/predict.py
-#
-# class TorchBackendExtractor(VBxExtractor):
-#     def __init__(self):
-#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-#         model_path = get_remote("raw_81.pth")
-#         model = ResNet101(feat_dim=FEAT_DIM, embed_dim=EMBED_DIM)
-#         model = model.to(self.device)
-#         checkpoint = torch.load(model_path, map_location=self.device)
-#         model.load_state_dict(checkpoint['state_dict'], strict=False)
-#         model.eval()
-#         self.model = model
-#
-#     def get_embedding(self, fea):
-#         with torch.no_grad():
-#             data = torch.from_numpy(fea).to(self.device)
-#             data = data[None, :, :]
-#             data = torch.transpose(data, 1, 2)
-#             spk_embeds = self.model(data)
-#             return spk_embeds.data.cpu().numpy()[0]
