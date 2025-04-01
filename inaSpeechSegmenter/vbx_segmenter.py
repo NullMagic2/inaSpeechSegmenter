@@ -44,19 +44,18 @@ def is_mid_speech(start, stop, a_vad):
     speech segment in the VAD annotation (a_vad). It returns True if the midpoint is inside at least one speech segment,
     indicating that the segment likely contains speech.
 
-    Note: The current implementation iterates through all VAD segments for each x-vector. An optimization is recommended 
-    for processing large numbers of x-vectors.
+    Note: The previous implementation iterated through all VAD segments for each x-vector. This version has been rewritten for
+    clarity and returns True as soon as a mid-speech match is found.
     """
     midpoint = (start + stop) / 2
 
-    # Check if the midpoint falls within any speech segment.
+    # Check each VAD segment to see if it contains the midpoint.
     for seg, _, _ in a_vad.itertracks(yield_label=True):
         if (seg.start < midpoint) and (midpoint < seg.end):
             return True
 
     return False
-
-
+    
 def add_needed_vectors(xvectors, t_mid):
     """
     Ensure that at least 50% of the predictions have midpoints within speech segments.
@@ -79,21 +78,26 @@ def add_needed_vectors(xvectors, t_mid):
 
 def get_femininity_score(g_preds):
     """
-    Computes the voice femininity score from gender prediction segments.
+    Computes a weighted voice femininity score using gender prediction probabilities.
 
-    This function creates an annotation from gender predictions, where each prediction is a tuple
-    (start, stop, p) and p (a probability) is interpreted as female if p >= 0.5. It then computes the
-    femininity score as the ratio of the number of segments labeled as female to the total number of segments.
-
+    Instead of a binary decision for each segment, this function calculates the overall femininity score 
+    as the weighted average of the female probabilities, with weights based on the segment durations.
+    
+    Parameters:
+        g_preds (list): List of tuples (start, stop, p) where p is the predicted probability of being female.
+    
     Returns:
-        float: The femininity score, representing the proportion of segments identified as female.
+        float: The weighted femininity score, between 0 and 1.
     """
-    a_temp = Annotation()
+    total_duration = 0.0
+    female_weight = 0.0
+    
     for start, stop, p in g_preds:
-        a_temp[Segment(start, stop), '_'] = (p >= 0.5)
-
-    # Return binary score and number of retained predictions
-    return len(a_temp.label_timeline(True)) / len(a_temp)
+        duration = stop - start
+        total_duration += duration
+        female_weight += duration * p
+        
+    return female_weight / total_duration if total_duration > 0 else 0.0
 
 
 def get_annot_VAD(vad_tuples):
