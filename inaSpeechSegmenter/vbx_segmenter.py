@@ -47,9 +47,14 @@ def is_mid_speech(start, stop, a_vad):
     Note: The current implementation iterates through all VAD segments for each x-vector. An optimization is recommended 
     for processing large numbers of x-vectors.
     """
-    m = (start + stop) / 2
-    is_speech = [True if seg.start < m < seg.end else False for seg, _, _ in a_vad.itertracks(yield_label=True)]
-    return np.any(is_speech)
+    midpoint = (start + stop) / 2
+
+    # Check if the midpoint falls within any speech segment.
+    for seg, _, _ in a_vad.itertracks(yield_label=True):
+        if (seg.start < midpoint) and (midpoint < seg.end):
+            return True
+
+    return False
 
 
 def add_needed_vectors(xvectors, t_mid):
