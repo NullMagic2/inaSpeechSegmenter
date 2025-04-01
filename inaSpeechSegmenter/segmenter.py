@@ -297,44 +297,70 @@ class Segmenter:
     """
     def __init__(self, vad_engine='smn', detect_gender=True, ffmpeg='ffmpeg', batch_size=32, energy_ratio=0.03):
         """
-        Initializes the Segmenter by configuring and loading the necessary neural network models for audio segmentation.
-    
+        Initializes the Segmenter by configuring and loading the necessary neural network
+        models for audio segmentation.
+
         Parameters:
-            vad_engine (str): Specifies the voice activity detection engine to use. Options are:
+            vad_engine (str): Specifies the voice activity detection engine to use.
+                              Options are:
                               'sm'  for speech/music (used in ICASSP 2017 and MIREX 2018),
                               'smn' for speech/music/noise (a more recent implementation).
-            detect_gender (bool): If True, further splits speech segments into 'male' and 'female' using a dedicated gender model.
-                                  If False, speech segments remain labeled as 'speech'.
-            ffmpeg (str): The command to invoke ffmpeg, used for converting input media to a 16kHz mono WAV signal.
-            batch_size (int): Batch size for neural network inference. Higher values improve speed but require more GPU memory.
-            energy_ratio (float): The ratio used to set the energy threshold in the initial energy-based voice activity detection.
-    
-        The __init__ method verifies that ffmpeg is available, sets the energy detection ratio, selects the appropriate 
-        VAD model based on vad_engine, and loads the gender detection model if required. These configurations prepare 
-        the Segmenter for processing individual media files or batches of files for segmentation.
-        """     
+                              Defaults to 'smn'.
+            detect_gender (bool): If True, further splits speech segments into 'male' and
+                                  'female' using a dedicated gender model. If False,
+                                  speech segments remain labeled as 'speech'. Defaults to True.
+            ffmpeg (str): The command or path to invoke the ffmpeg executable, used for
+                          converting input media to a 16kHz mono WAV signal.
+                          Defaults to 'ffmpeg'.
+            batch_size (int): Batch size for neural network inference. Higher values
+                              may improve speed on GPUs but require more memory.
+                              Defaults to 32.
+            energy_ratio (float): The ratio used to set the threshold in the initial
+                                  energy-based voice activity detection relative to the
+                                  mean log energy. Lower values increase sensitivity.
+                                  Defaults to 0.03.
 
+        Raises:
+            Exception: If the specified ffmpeg command is not found in the system path
+                       or is not executable.
+            AssertionError: If vad_engine is not 'sm' or 'smn', or if detect_gender
+                            is not True or False.
+        """
+        # --- FFmpeg Check ---
         if ffmpeg is not None:
-            # test ffmpeg installation
+            # Use shutil.which to check if ffmpeg command exists and is executable
             if shutil.which(ffmpeg) is None:
-                raise(Exception("""ffmpeg program not found"""))
+                raise Exception(f"ffmpeg command '{ffmpeg}' not found or not executable. "
+                                f"Please ensure ffmpeg is installed and in your system's PATH, "
+                                f"or provide the full path.")
         self.ffmpeg = ffmpeg
 
-        # set energic ratio for 1st VAD
+        # --- Store Configuration ---
         self.energy_ratio = energy_ratio
+        self.batch_size = batch_size # Store batch_size if needed elsewhere
 
-        # select speech/music or speech/music/noise voice activity detection engine
-        assert vad_engine in ['sm', 'smn']
+        # Store detect_gender flag internally for post-processing logic
+        self._detect_gender_enabled = bool(detect_gender)
+        # Store VAD instance for accessing outlabels later
+        self._vad_instance = None
+
+        # --- Select and Load VAD Model ---
+        assert vad_engine in ['sm', 'smn'], "vad_engine must be 'sm' or 'smn'"
         if vad_engine == 'sm':
             self.vad = SpeechMusic(batch_size)
         elif vad_engine == 'smn':
             self.vad = SpeechMusicNoise(batch_size)
+        # Keep a reference to the VAD instance
+        self._vad_instance = self.vad
 
-        # load gender detection NN if required
-        assert detect_gender in [True, False]
-        self.detect_gender = detect_gender
-        if detect_gender:
+        # --- Load Gender Model (if required) ---
+        # Public attribute `detect_gender` can be used externally if needed
+        self.detect_gender = self._detect_gender_enabled
+        if self.detect_gender:
             self.gender = Gender(batch_size)
+        else:
+            # Ensure self.gender is None if not used, prevents potential AttributeError
+            self.gender = None
 
 
     def segment_feats(self, mspec, loge, difflen, start_sec):
@@ -371,14 +397,82 @@ class Segmenter:
 
         return [(lab, start_sec + start * .02, start_sec + stop * .02) for lab, start, stop in lseg]
 
+    def merge_short_gaps(segment_list, speech_labels, max_gap_duration_sec, min_speech_duration_sec=0.0):
+        """
+        Merges short non-speech segments that occur between speech segments.
+        Optionally filters out very short speech segments after merging.
+    
+        Args:
+            segment_list (list): List of (label, start_time_sec, stop_time_sec) tuples,
+                                 sorted chronologically.
+            speech_labels (set): A set containing all labels that should be treated as 'speech'
+                                 (e.g., {'speech'}, or {'male', 'female'}).
+            max_gap_duration_sec (float): The maximum duration (in seconds) of a
+                                          non-speech segment to be merged if it's
+                                          between two speech segments.
+            min_speech_duration_sec (float): Optional. If greater than 0, speech segments
+                                            shorter than this duration (in seconds) will
+                                            be removed from the final list. Defaults to 0.0 (no filtering).
+    
+        Returns:
+            list: A new segment list with short gaps merged and optionally short speech
+                  segments filtered.
+        """
+        if not segment_list:
+            return []
+    
+        # Ensure speech_labels is a set for efficient checking
+        if not isinstance(speech_labels, set):
+            speech_labels = set(speech_labels)
+    
+        merged_list = []
+        i = 0
+        while i < len(segment_list):
+            current_label, current_start, current_stop = segment_list[i]
+    
+            # Look ahead: Check if the pattern is Speech - Gap - Speech
+            if (current_label in speech_labels and
+                    i + 2 < len(segment_list)): # Check if there are at least two more segments
+    
+                gap_label, gap_start, gap_stop = segment_list[i+1]
+                next_label, next_start, next_stop = segment_list[i+2]
+    
+                # Check if the pattern matches: Speech - NonSpeech - Speech
+                if (gap_label not in speech_labels and
+                        next_label in speech_labels):
+    
+                    gap_duration = gap_stop - gap_start
+                    # Check if the gap is short enough to merge
+                    if gap_duration <= max_gap_duration_sec:
+                        # Merge by extending the current speech segment to the end of the next one
+                        merged_segment = (current_label, current_start, next_stop)
+                        merged_list.append(merged_segment)
+                        # Skip the next two segments (gap and the second speech segment)
+                        i += 3
+                        continue # Continue to the next potential segment after the merge
+    
+            # If no merge pattern was found or applied, add the current segment
+            merged_list.append((current_label, current_start, current_stop))
+            i += 1
+    
+        # --- Optional filtering stage ---
+        if min_speech_duration_sec > 0.0:
+            final_list = []
+            for label, start, stop in merged_list:
+                duration = stop - start
+                # Keep segment if it's not speech OR if it is speech and meets minimum duration
+                if label not in speech_labels or duration >= min_speech_duration_sec:
+                    final_list.append((label, start, stop))
+            return final_list
+        else:
+            # If no filtering, return the list with merged gaps
+            return merged_list
+
 
     def __call__(self, medianame, tmpdir=None, start_sec=None, stop_sec=None):
         """
-        Processes a media file to perform segmentation.
-
-        This method converts the input media file (which may be a local file or remote URL in any ffmpeg-supported format)
-        into a 16kHz mono WAV file, extracts features (mel spectrogram and log energy), and applies the segmentation pipeline 
-        (energy detection, DNN-based segmentation, and optional gender classification) to output time-aligned segment labels.
+        Processes a media file to perform segmentation and applies post-processing
+        to merge short non-speech gaps.
 
         Parameters:
             medianame: path or URL to the media file.
@@ -387,14 +481,57 @@ class Segmenter:
             stop_sec: end time in seconds; audio after this point is ignored.
 
         Returns:
-            A list of tuples (label, start, stop) representing the final segmentation of the audio.
+            A list of tuples (label, start, stop) representing the final segmentation
+            after gap merging and optional short segment filtering.
         """
-        
+
         mspec, loge, difflen = _media2feats(medianame, tmpdir, start_sec, stop_sec, self.ffmpeg)
-        if start_sec is None:
-            start_sec = 0
-        # do segmentation   
-        return self.segment_feats(mspec, loge, difflen, start_sec)
+        # Use 0 as start_sec if None, for relative time calculations in segment_feats
+        effective_start_sec = start_sec if start_sec is not None else 0
+
+        # --- Step 1: Get the initial segmentation ---
+        # segment_feats returns segments with absolute times (relative to 0 or original start_sec)
+        lseg_initial = self.segment_feats(mspec, loge, difflen, effective_start_sec)
+
+        # --- Step 2: Define parameters for post-processing ---
+        # Determine which labels indicate speech based on configuration
+        # Access the internal flag set during __init__
+        if self._detect_gender_enabled:
+            # Gender model outputs 'female', 'male'
+            speech_labels_to_merge = {'female', 'male'}
+        else:
+            # Access the VAD instance stored during __init__
+            if self._vad_instance:
+                 # Find the label(s) corresponding to speech in the VAD model's output labels
+                 speech_labels_to_merge = {label for label in self._vad_instance.outlabels if 'speech' in label.lower()}
+            else:
+                 # Fallback if _vad_instance wasn't set (shouldn't happen with current init)
+                 warnings.warn("VAD instance not found, defaulting speech labels to {'speech'}")
+                 speech_labels_to_merge = {'speech'}
+
+            # Handle case where no speech label is dynamically found
+            if not speech_labels_to_merge:
+                 warnings.warn("Could not determine speech labels from VAD model for merging.")
+                 # Fallback or default, e.g., {'speech'} if guaranteed
+                 speech_labels_to_merge = {'speech'}
+
+
+        # --- Tune these parameters based on your specific needs and evaluation ---
+        # Example values - adjust these after testing!
+        max_gap_to_fill_sec = 0.3 # Merge non-speech gaps up to 300ms long
+        min_speech_duration_to_keep_sec = 0.1 # Optional: Remove speech segments shorter than 100ms
+
+        # --- Step 3: Apply the merging function ---
+        # Ensure the merge_short_gaps function is defined or imported
+        lseg_merged = merge_short_gaps(
+            segment_list=lseg_initial,
+            speech_labels=speech_labels_to_merge,
+            max_gap_duration_sec=max_gap_to_fill_sec,
+            min_speech_duration_sec=min_speech_duration_to_keep_sec
+        )
+
+        # --- Step 4: Return the processed list ---
+        return lseg_merged
 
     
     def batch_process(self, linput, loutput, tmpdir=None, verbose=False, skipifexist=False, nbtry=1, trydelay=2., output_format='csv'):
