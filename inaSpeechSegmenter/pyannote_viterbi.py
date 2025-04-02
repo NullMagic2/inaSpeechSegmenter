@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+from __future__ import unicode_literals
+
 # encoding: utf-8
 
 # The MIT License (MIT)
@@ -52,8 +54,6 @@ sequential decision-making tasks that require constrained decoding.
 
 This file has been updated for compatibility with numpy>=1.24 and is part of the pyannote core project.
 """
-
-from __future__ import unicode_literals
 
 import numpy as np
 import itertools
