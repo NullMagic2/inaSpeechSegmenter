@@ -163,87 +163,49 @@ def _update_states(states, consecutive):
 def viterbi_decoding(emission, transition,
                      initial=None, consecutive=None, constraint=None):
     """
-    Converts the expanded (duplicated) state indices from the Viterbi decoding back to the original state labels.
-    This mapping is essential after decoding in the expanded state space, where states were duplicated to enforce
-    minimum consecutive constraints, so that the final state sequence reflects the original state definitions.
+    Constrained Viterbi Decoding
+
+    This function computes the most probable sequence of hidden states given a series of observations,
+    using the Viterbi algorithm. It supports constraints to enforce minimum consecutive state durations 
+    and to restrict certain states at specific times (e.g., forbidding or forcing states).
+
+    Parameters:
+        emission : numpy.ndarray, shape (n_samples, n_states)
+            The log-probabilities for each state at each observation.
+        transition : numpy.ndarray, shape (n_states, n_states)
+            The log-probabilities of transitioning from one state to another.
+        initial : optional, numpy.ndarray, shape (n_states,)
+            The initial log-probabilities for each state.
+        consecutive : optional, int or numpy.ndarray, shape (n_states,)
+            The minimum number of consecutive observations that each state must persist.
+        constraint : optional, numpy.ndarray, shape (n_samples, n_states)
+            A matrix specifying state constraints at each time step.
+
+    Returns:
+        numpy.ndarray, shape (n_samples,)
+            The most probable sequence of states after applying the constrained Viterbi decoding.
     """
-
-    boundary = np.hstack(([0], np.cumsum(consecutive)))
-    start = boundary[:-1]
-    end = boundary[1:]
-
-    new_states = np.empty(states.shape)
-
-    for i, (s, e) in enumerate(zip(start, end)):
-        new_states[np.where((s <= states) & (states < e))] = i
-
-    return new_states
-
-
-def viterbi_decoding(emission, transition,
-                     initial=None, consecutive=None, constraint=None):
-      """
-      Constrained Viterbi Decoding
-  
-      This function computes the most probable sequence of hidden states given a series of observations,
-      using the Viterbi algorithm. It supports constraints to enforce minimum consecutive state durations 
-      and to restrict certain states at specific times (e.g., forbidding or forcing states).
-  
-      Parameters:
-          emission : numpy.ndarray, shape (n_samples, n_states)
-              The log-probabilities for each state at each observation (E[t, i] is the emission log-probability
-              of sample t for state i).
-          transition : numpy.ndarray, shape (n_states, n_states)
-              The log-probabilities of transitioning from one state to another (T[i, j] is the transition log-probability
-              from state i to state j).
-          initial : optional, numpy.ndarray, shape (n_states,)
-              The initial log-probabilities for each state. If not provided, a uniform distribution is assumed.
-          consecutive : optional, int or numpy.ndarray, shape (n_states,)
-              The minimum number of consecutive observations that each state must persist.
-              A value of 1 indicates no constraint. This is used to expand the state space to enforce duration constraints.
-          constraint : optional, numpy.ndarray, shape (n_samples, n_states)
-              A matrix specifying state constraints at each time step:
-                  - 0: no constraint,
-                  - 1: state is forbidden,
-                  - 2: state is forced.
-                  
-      Returns:
-          numpy.ndarray, shape (n_samples,)
-              The most probable sequence of states after applying the constrained Viterbi decoding.
-      
-      The function adjusts the emission, transition, initial, and constraint matrices by duplicating states to satisfy the
-      minimum consecutive constraints. It then performs a forward pass to compute the optimal path probabilities, followed by 
-      backtracking to recover the best state sequence, and finally maps the duplicated state indices back to the original states.
-      """
-
     # ~~ INITIALIZATION ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
     T, k = emission.shape  # number of observations x number of states
 
-    # no minimum-consecutive-states constraints
+    # Handle consecutive constraints
     if consecutive is None:
-        consecutive = np.ones((k, ), dtype=int)
-
-    # same value for all states
+        consecutive = np.ones((k,), dtype=int)
     elif isinstance(consecutive, int):
-        consecutive = consecutive * np.ones((k, ), dtype=int)
-
-    # (potentially) different values per state
+        consecutive = consecutive * np.ones((k,), dtype=int)
     else:
-        consecutive = np.array(consecutive, dtype=int).reshape((k, ))
-
-    # at least one sample
+        consecutive = np.array(consecutive, dtype=int).reshape((k,))
     consecutive = np.maximum(1, consecutive)
 
-    # balance initial probabilities when they are not provided
+    # Set initial probabilities if not provided
     if initial is None:
-        initial = np.log(np.ones((k, )) / k)
+        initial = np.log(np.ones((k,)) / k)
 
-    # no constraint?
+    # Set constraints if not provided
     if constraint is None:
         constraint = VITERBI_CONSTRAINT_NONE * np.ones((T, k))
 
-    # artificially create new states to account for 'consecutive' constraints
+    # Expand matrices to account for 'consecutive' constraints
     emission = _update_emission(emission, consecutive)
     transition = _update_transition(transition, consecutive)
     initial = _update_initial(initial, consecutive)
@@ -251,39 +213,21 @@ def viterbi_decoding(emission, transition,
     T, K = emission.shape  # number of observations x number of new states
     states = np.arange(K)  # states 0 to K-1
 
-    # set emission probability to zero for forbidden states
-    emission[
-        np.where(constraint == VITERBI_CONSTRAINT_FORBIDDEN)] = LOG_ZERO
-
-    # set emission probability to zero for all states but the mandatory one
-    for t, k in zip(
-        *np.where(constraint == VITERBI_CONSTRAINT_MANDATORY)
-    ):
+    # Adjust emission probabilities for constraints
+    emission[np.where(constraint == VITERBI_CONSTRAINT_FORBIDDEN)] = LOG_ZERO
+    for t, k in zip(*np.where(constraint == VITERBI_CONSTRAINT_MANDATORY)):
         emission[t, states != k] = LOG_ZERO
 
     # ~~ FORWARD PASS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    V = np.empty((T, K))
+    V[0, :] = emission[0, :] + initial
 
-    V = np.empty((T, K))                # V[t, k] is the probability of the
-    V[0, :] = emission[0, :] + initial  # most probable state sequence for the
-                                        # first t observations that has k as
-                                        # its final state.
-
-    P = np.empty((T, K), dtype=int)  # P[t, k] remembers which state was used
-    P[0, :] = states                 # to get from time t-1 to time t at
-                                     # state k
+    P = np.empty((T, K), dtype=int)
+    P[0, :] = states
 
     for t in range(1, T):
-
-        # tmp[k, k'] is the probability of the most probable path
-        # leading to state k at time t - 1, plus the probability of
-        # transitioning from state k to state k' (at time t)
         tmp = (V[t - 1, :] + transition.T).T
-
-        # optimal path to state k at t comes from state P[t, k] at t - 1
-        # (find among all possible states at this time t)
         P[t, :] = np.argmax(tmp, axis=0)
-
-        # update V for time t
         V[t, :] = emission[t, :] + tmp[P[t, :], states]
 
     # ~~ BACK-TRACKING ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -292,6 +236,5 @@ def viterbi_decoding(emission, transition,
     for t in range(1, T):
         X[-(t + 1)] = P[-t, X[-t]]
 
-    # ~~ CONVERT BACK TO ORIGINAL STATES
-
+    # ~~ CONVERT BACK TO ORIGINAL STATES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     return _update_states(X, consecutive)
