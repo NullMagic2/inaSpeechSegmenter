@@ -397,7 +397,7 @@ class Segmenter:
 
         return [(lab, start_sec + start * .02, start_sec + stop * .02) for lab, start, stop in lseg]
 
-    def merge_short_gaps(segment_list, speech_labels, max_gap_duration_sec, min_speech_duration_sec=0.0):
+    def merge_short_gaps(self, segment_list, speech_labels, max_gap_duration_sec, min_speech_duration_sec=0.0):
         """
         Merges short non-speech segments that occur between speech segments.
         Optionally filters out very short speech segments after merging.
@@ -523,7 +523,7 @@ class Segmenter:
 
         # --- Step 3: Apply the merging function ---
         # Ensure the merge_short_gaps function is defined or imported
-        lseg_merged = merge_short_gaps(
+        lseg_merged = self.merge_short_gaps(
             segment_list=lseg_initial,
             speech_labels=speech_labels_to_merge,
             max_gap_duration_sec=max_gap_to_fill_sec,
